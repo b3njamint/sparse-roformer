@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch RoFormer model. """
+"""PyTorch RoFormer model."""
 
 
 import math
@@ -31,7 +31,7 @@ from transformers.file_utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
-    ModelOutput
+    ModelOutput,
 )
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -55,6 +55,7 @@ from typing import Optional, Tuple
 from transformers.utils import logging
 from .configuration_roformer import RoFormerConfig
 
+from sparsemax import Sparsemax
 
 logger = logging.get_logger(__name__)
 
@@ -80,8 +81,9 @@ ROFORMER_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all RoFormer models at https://huggingface.co/models?filter=roformer
 ]
 
+
 class Norm(nn.Module):
-    def __init__(self, eps = 1e-12):
+    def __init__(self, eps=1e-12):
         super().__init__()
         self.eps = eps
 
@@ -91,14 +93,13 @@ class Norm(nn.Module):
 
 
 def initializer(tensor, num_hidden_layers=12, order=2, gain=1.0):
-    """使用截断正态分布初始化
-    """
+    """使用截断正态分布初始化"""
     shape = tensor.shape
     if shape[0] > 10000 or shape[0] < 10:
         hidden_size = shape[1]
     else:
         hidden_size = shape[0]
-    gain *= num_hidden_layers**(-1. / order)
+    gain *= num_hidden_layers ** (-1.0 / order)
     std = 1.13684723 / hidden_size**0.5 * gain
     return nn.init.trunc_normal_(tensor, std=std)
 
@@ -143,6 +144,7 @@ class CausalLMOutputWithPoolingAndCrossAttentions(ModelOutput):
             Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
     """
+
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     pooler_output: torch.FloatTensor = None
@@ -290,7 +292,11 @@ class RoFormerEmbeddings(nn.Module):
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps) if config.norm_type=="layer_norm" else Norm(eps=config.layer_norm_eps)
+        self.LayerNorm = (
+            nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps)
+            if config.norm_type == "layer_norm"
+            else Norm(eps=config.layer_norm_eps)
+        )
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, input_ids=None, token_type_ids=None, inputs_embeds=None):
@@ -331,9 +337,15 @@ class RoFormerSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.use_bias)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.use_bias)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.use_bias)
+        self.query = nn.Linear(
+            config.hidden_size, self.all_head_size, bias=config.use_bias
+        )
+        self.key = nn.Linear(
+            config.hidden_size, self.all_head_size, bias=config.use_bias
+        )
+        self.value = nn.Linear(
+            config.hidden_size, self.all_head_size, bias=config.use_bias
+        )
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -413,7 +425,9 @@ class RoFormerSelfAttention(nn.Module):
             attention_scores = attention_scores + attention_mask
 
         # Normalize the attention scores to probabilities.
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        # attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        sparsemax = Sparsemax(dim=-1)
+        attention_probs = sparsemax(attention_scores)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -444,14 +458,23 @@ class RoFormerSelfAttention(nn.Module):
         # 如果是旋转query key的话，下面这个直接cat就行，因为要进行矩阵乘法，最终会在这个维度求和。（只要保持query和key的最后一个dim的每一个位置对应上就可以）
         # torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
         # 如果是旋转value的话，下面这个stack后再flatten才可以，因为训练好的模型最后一个dim是两两之间交替的。
-        return torch.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).flatten(-2, -1)
+        return torch.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).flatten(
+            -2, -1
+        )
+
 
 # Copied from transformers.models.bert.modeling_bert.BertSelfOutput with Bert->RoFormer
 class RoFormerSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=config.use_bias)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) if config.norm_type=="layer_norm" else Norm(eps=config.layer_norm_eps)
+        self.dense = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.use_bias
+        )
+        self.LayerNorm = (
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            if config.norm_type == "layer_norm"
+            else Norm(eps=config.layer_norm_eps)
+        )
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -525,7 +548,9 @@ class RoFormerAttention(nn.Module):
 class RoFormerIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.use_bias)
+        self.dense = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.use_bias
+        )
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -541,8 +566,14 @@ class RoFormerIntermediate(nn.Module):
 class RoFormerOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.use_bias)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) if config.norm_type=="layer_norm" else Norm(eps=config.layer_norm_eps)
+        self.dense = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.use_bias
+        )
+        self.LayerNorm = (
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            if config.norm_type == "layer_norm"
+            else Norm(eps=config.layer_norm_eps)
+        )
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -690,9 +721,9 @@ class RoFormerEncoder(nn.Module):
             past_key_values[0][0].shape[2] if past_key_values is not None else 0
         )
         # [sequence_length, embed_size_per_head] -> sin & cos [batch_size, num_heads, sequence_length, embed_size_per_head // 2]
-        sinusoidal_pos = self.embed_positions(hidden_states.shape[1], past_key_values_length)[
-            None, None, :, :
-        ].chunk(2, dim=-1)
+        sinusoidal_pos = self.embed_positions(
+            hidden_states.shape[1], past_key_values_length
+        )[None, None, :, :].chunk(2, dim=-1)
 
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
@@ -785,6 +816,7 @@ class RoFormerPredictionHeadTransform(nn.Module):
         hidden_states = self.LayerNorm(hidden_states)
         return hidden_states
 
+
 class RoFormerV2LMPredictionHead(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -818,7 +850,11 @@ class RoFormerLMPredictionHead(nn.Module):
 class RoFormerOnlyMLMHead(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.predictions = RoFormerLMPredictionHead(config) if config.norm_type=="layer_norm" else RoFormerV2LMPredictionHead(config)
+        self.predictions = (
+            RoFormerLMPredictionHead(config)
+            if config.norm_type == "layer_norm"
+            else RoFormerV2LMPredictionHead(config)
+        )
 
     def forward(self, sequence_output):
         prediction_scores = self.predictions(sequence_output)
@@ -868,14 +904,18 @@ class RoFormerPreTrainedModel(PreTrainedModel):
                 if module.bias is not None:
                     module.bias.data.zero_()
             else:
-                initializer(module.weight.data, self.config.num_hidden_layers, order=2, gain=1.0)
+                initializer(
+                    module.weight.data, self.config.num_hidden_layers, order=2, gain=1.0
+                )
         elif isinstance(module, RoFormerSinusoidalPositionalEmbedding):
             pass
         elif isinstance(module, nn.Embedding):
             if self.config.norm_type == "layer_norm":
                 module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             else:
-                initializer(module.weight.data, self.config.num_hidden_layers, order=2, gain=1.0)
+                initializer(
+                    module.weight.data, self.config.num_hidden_layers, order=2, gain=1.0
+                )
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
@@ -1136,13 +1176,19 @@ class RoFormerModel(RoFormerPreTrainedModel):
         )
 
     # 添加了个past_key_values_length
-    def get_extended_attention_mask(self, attention_mask, input_shape, device, past_key_values_length):
+    def get_extended_attention_mask(
+        self, attention_mask, input_shape, device, past_key_values_length
+    ):
         if attention_mask.dim() == 3:
             extended_attention_mask = attention_mask[:, None, :, :]
         elif attention_mask.dim() == 2:
-            if self.config.is_decoder and past_key_values_length > 0: # 第一次编码的时候不需要使用decoder mask，之后的需要decoder mask。
-                extended_attention_mask = self.create_extended_attention_mask_for_decoder(
-                    input_shape, attention_mask, device
+            if (
+                self.config.is_decoder and past_key_values_length > 0
+            ):  # 第一次编码的时候不需要使用decoder mask，之后的需要decoder mask。
+                extended_attention_mask = (
+                    self.create_extended_attention_mask_for_decoder(
+                        input_shape, attention_mask, device
+                    )
                 )
             else:
                 extended_attention_mask = attention_mask[:, None, None, :]
@@ -1156,7 +1202,9 @@ class RoFormerModel(RoFormerPreTrainedModel):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
-        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)  # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.to(
+            dtype=self.dtype
+        )  # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         return extended_attention_mask
 
@@ -1313,7 +1361,8 @@ class RoFormerForCausalLM(RoFormerPreTrainedModel):
         ROFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length")
     )
     @replace_return_docstrings(
-        output_type=CausalLMOutputWithPoolingAndCrossAttentions, config_class=_CONFIG_FOR_DOC
+        output_type=CausalLMOutputWithPoolingAndCrossAttentions,
+        config_class=_CONFIG_FOR_DOC,
     )
     def forward(
         self,
@@ -1379,7 +1428,7 @@ class RoFormerForCausalLM(RoFormerPreTrainedModel):
             >>>     for _ in range(n):
             >>>         inputs1.to(device)
             >>>         output = tokenizer.batch_decode(model.generate(**inputs1, top_p=0.95, do_sample=True, max_length=128), skip_special_tokens=True)[0].replace(" ","").replace(text, "") # 去除空格，去除原始text文本。
-            >>>         r.append(output)     
+            >>>         r.append(output)
             >>>     # 对相似的句子进行排序
             >>>     r = [i for i in set(r) if i != text and len(i) > 0]
             >>>     r = [text] + r
@@ -1389,7 +1438,7 @@ class RoFormerForCausalLM(RoFormerPreTrainedModel):
             >>>         outputs = model(**inputs2)
             >>>         Z = outputs.pooler_output.cpu().numpy()
             >>>     Z /= (Z**2).sum(axis=1, keepdims=True)**0.5
-            >>>     argsort = np.dot(Z[1:], -Z[0]).argsort()    
+            >>>     argsort = np.dot(Z[1:], -Z[0]).argsort()
             >>>     return [r[i + 1] for i in argsort[:k]]
             >>> out = gen_synonyms("广州和深圳哪个好？")
             >>> print(out)
@@ -1448,13 +1497,13 @@ class RoFormerForCausalLM(RoFormerPreTrainedModel):
             )
 
         if not return_dict:
-            output = (prediction_scores,) + outputs[1:] # with pooler
+            output = (prediction_scores,) + outputs[1:]  # with pooler
             return ((lm_loss,) + output) if lm_loss is not None else output
 
         return CausalLMOutputWithPoolingAndCrossAttentions(
             loss=lm_loss,
             logits=prediction_scores,
-            pooler_output=outputs.pooler_output, # with pooler_output
+            pooler_output=outputs.pooler_output,  # with pooler_output
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -1462,7 +1511,12 @@ class RoFormerForCausalLM(RoFormerPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past=None, attention_mask=None, token_type_ids=None, **model_kwargs
+        self,
+        input_ids,
+        past=None,
+        attention_mask=None,
+        token_type_ids=None,
+        **model_kwargs,
     ):
         input_shape = input_ids.shape
 
@@ -1483,7 +1537,7 @@ class RoFormerForCausalLM(RoFormerPreTrainedModel):
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids, 
+            "token_type_ids": token_type_ids,
             "past_key_values": past,
         }
 
